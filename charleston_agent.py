@@ -1,5 +1,5 @@
 import os
-from playwright.sync_api import TimeoutError
+from playwright.sync_api import TimeoutError, Error
 
 class CharlestonAgent:
     def __init__(self, playwright, headless=True):
@@ -38,14 +38,10 @@ class CharlestonAgent:
         print(f"✅ Saved Property Card PDF for TMS {tms} at {pdf_path}")
 
         return book_page_pairs
-    
-
-
-    
 
     def save_deed_pdf(self, book, page_num, output_folder):
+        page = self.context.new_page()
         try:
-            page = self.context.new_page()
             page.goto("https://www.charlestoncounty.org/departments/rod/ds-DMBookandPage.php", timeout=60000)
 
             page.fill('input#booknumber', book)
@@ -75,56 +71,64 @@ class CharlestonAgent:
 
             if not view_link:
                 print(f"❌ No View link found for Book {book} Page {page_num}")
-                page.close()
                 return
 
-            view_link.scroll_into_view_if_needed()
+            try:
+                view_link.scroll_into_view_if_needed(timeout=10000)
+            except TimeoutError:
+                print(f"⚠️ Timeout scrolling view link for Book {book} Page {page_num}")
+
             with self.context.expect_page() as new_page_info:
                 view_link.click()
 
             pdf_page = new_page_info.value
+
+            pdf_page.wait_for_load_state("load")
             pdf_page.wait_for_load_state("networkidle")
-            pdf_page.wait_for_timeout(3000)
+            pdf_page.wait_for_timeout(2000)
 
-            title = pdf_page.title().lower()
-            url = pdf_page.url.lower()
-            if "404" in title or "not found" in title or "error" in title or "404" in url:
-                print(f"❌ 404 or invalid page for Book {book} Page {page_num}: {pdf_page.url}")
-                pdf_page.close()
-                return
+            try:
+                pdf_page.wait_for_selector("canvas", timeout=15000)
+                print(f"🖼️ PDF canvas found for Book {book} Page {page_num}")
+            except TimeoutError:
+                print(f"⚠️ PDF canvas not found, proceeding anyway for Book {book} Page {page_num}")
 
-            os.makedirs(output_folder, exist_ok=True)
-            save_path = os.path.join(output_folder, f"DB_{book}_{page_num}.pdf")
-
-            if pdf_page.url.endswith('.pdf'):
-                pdf_page.pdf(path=save_path)
-            else:
+            frame = None
+            try:
                 frame = pdf_page.query_selector('iframe[src*=".pdf"], embed[type="application/pdf"]')
-                if frame:
-                    pdf_url = frame.get_attribute("src")
-                    if pdf_url:
-                        pdf_page.goto(pdf_url)
-                        pdf_page.wait_for_load_state("networkidle")
-                        pdf_page.wait_for_timeout(3000)
-                        pdf_page.pdf(path=save_path)
-                    else:
-                        print(f"⚠️ No src attribute found on PDF frame. Using fallback screenshot.")
-                        pdf_page.screenshot(path=save_path.replace(".pdf", ".png"), full_page=True)
-                else:
-                    print(f"⚠️ No embedded PDF URL found, using fallback page PDF.")
-                    pdf_page.screenshot(path=save_path.replace(".pdf", ".png"), full_page=True)
+            except Error as e:
+                print(f"⚠️ Error querying for PDF frame: {e}")
 
-            print(f"✅ Saved deed PDF: {save_path if os.path.exists(save_path) else save_path.replace('.pdf', '.png')}")
+            save_path = os.path.join(output_folder, f"DB_{book}_{page_num}.pdf")
+            os.makedirs(output_folder, exist_ok=True)
+
+            if frame:
+                pdf_url = frame.get_attribute("src")
+                if pdf_url and not pdf_url.startswith("about:blank"):
+                    pdf_page.goto(pdf_url)
+                    pdf_page.wait_for_load_state("networkidle")
+                    pdf_page.wait_for_timeout(2000)
+                    pdf_page.pdf(path=save_path)
+                    print(f"✅ Saved deed PDF from iframe src: {save_path}")
+                else:
+                    pdf_page.pdf(path=save_path)
+                    print(f"✅ Saved deed PDF directly from page (iframe src blank): {save_path}")
+            else:
+                url = pdf_page.url.lower()
+                if pdf_page.url.endswith('.pdf') or ('pdf' in url):
+                    pdf_page.pdf(path=save_path)
+                    print(f"✅ Saved deed PDF directly: {save_path}")
+                else:
+                    pdf_page.pdf(path=save_path)
+                    print(f"✅ Saved deed PDF directly from page (no iframe): {save_path}")
+
             pdf_page.close()
-            page.close()
 
         except TimeoutError as te:
             print(f"❌ Timeout error on Book {book} Page {page_num}: {te}")
             error_path = os.path.join(output_folder, f"error_{book}_{page_num}.png")
             page.screenshot(path=error_path)
             print(f"📸 Screenshot saved: {error_path}")
-            page.close()
-
         except Exception as e:
             print(f"❌ Error processing Book {book} Page {page_num}: {e}")
             error_path = os.path.join(output_folder, f"error_{book}_{page_num}.png")
@@ -133,6 +137,7 @@ class CharlestonAgent:
                 print(f"📸 Screenshot saved: {error_path}")
             except Exception as ss_e:
                 print(f"⚠️ Failed to take screenshot: {ss_e}")
+        finally:
             page.close()
 
     def close(self):
