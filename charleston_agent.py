@@ -1,5 +1,6 @@
 import os
 from playwright.sync_api import TimeoutError, Error
+from urllib.parse import urlparse, parse_qs
 
 class CharlestonAgent:
     def __init__(self, playwright, headless=True):
@@ -13,10 +14,8 @@ class CharlestonAgent:
         self.page.click("text=Real Property Record Search")
         self.page.fill('input[title="PIN"]', tms)
         self.page.click('button:has-text("Search")')
-
         self.page.wait_for_selector('text=View Details')
         self.page.click('text=View Details')
-
         self.page.wait_for_load_state("load")
         self.page.wait_for_timeout(2000)
 
@@ -37,13 +36,59 @@ class CharlestonAgent:
         self.page.pdf(path=pdf_path)
         print(f"✅ Saved Property Card PDF for TMS {tms} at {pdf_path}")
 
-        return book_page_pairs
+        account_number = None
+        try:
+            self.page.wait_for_selector('a[title="Tax Info"]', timeout=10000)
+            self.page.click('a[title="Tax Info"]')
+            self.page.wait_for_url("**/AccountSummary.aspx**", timeout=15000)
+            self.page.wait_for_load_state("load")
+            self.page.wait_for_timeout(2000)
+
+            url = self.page.url
+            print(f"🔗 Tax Info URL: {url}")
+
+            if "AccountSummary.aspx" in url and "p=" in url and "&a=" in url:
+                parsed_url = urlparse(url)
+                params = parse_qs(parsed_url.query)
+                tms_number = params.get("p", [tms])[0]
+                account_number = params.get("a", [None])[0]
+
+                tax_pdf_path = os.path.join(output_folder, f"{tms_number}_Tax_Info.pdf")
+                try:
+                    self.page.wait_for_selector('a[title="Print Page"], cr-button[role="button"]', timeout=10000)
+                    with self.context.expect_page(timeout=10000) as print_page_info:
+                        print_link = self.page.query_selector('a[title="Print Page"]')
+                        if print_link:
+                            print_link.click()
+                        else:
+                            print_button = self.page.query_selector('cr-button[role="button"]')
+                            if print_button:
+                                print_button.click()
+                            else:
+                                raise Exception("Print button/link not found")
+                    print_page = print_page_info.value
+                    print_page.wait_for_load_state("load")
+                    print_page.wait_for_timeout(2000)
+                    print_page.pdf(path=tax_pdf_path)
+                    print_page.close()
+                    print(f"✅ Saved Tax Info PDF from print preview at {tax_pdf_path}")
+                except TimeoutError:
+                    self.page.pdf(path=tax_pdf_path)
+                    print(f"✅ Saved Tax Info PDF from current page at {tax_pdf_path}")
+            else:
+                print(f"⚠️ Unexpected Tax Info URL format: {url}")
+        except Exception as e:
+            print(f"❌ Error while handling Tax Info: {e}")
+
+        return book_page_pairs, account_number
 
     def save_deed_pdf(self, book, page_num, output_folder):
-        page = self.context.new_page()
+        # ✅ Use isolated context to avoid CAPTCHA blocks
+        isolated_context = self.browser.new_context()
+        page = isolated_context.new_page()
+
         try:
             page.goto("https://www.charlestoncounty.org/departments/rod/ds-DMBookandPage.php", timeout=60000)
-
             page.fill('input#booknumber', book)
             page.fill('input#pagenumber', page_num)
 
@@ -51,7 +96,7 @@ class CharlestonAgent:
             if checkbox and checkbox.get_attribute("type") == "checkbox":
                 checkbox.check()
             else:
-                print(f"⚠️ 'agreelegal' checkbox not found or is not a checkbox for Book {book} Page {page_num}")
+                print(f"⚠️ Checkbox not found or not clickable for Book {book} Page {page_num}")
 
             page.click('input[name="send_button"]')
             page.wait_for_selector("#myTable tbody tr", timeout=30000)
@@ -76,13 +121,12 @@ class CharlestonAgent:
             try:
                 view_link.scroll_into_view_if_needed(timeout=10000)
             except TimeoutError:
-                print(f"⚠️ Timeout scrolling view link for Book {book} Page {page_num}")
+                print(f"⚠️ Could not scroll to View link for Book {book} Page {page_num}")
 
-            with self.context.expect_page() as new_page_info:
+            with isolated_context.expect_page() as new_page_info:
                 view_link.click()
 
             pdf_page = new_page_info.value
-
             pdf_page.wait_for_load_state("load")
             pdf_page.wait_for_load_state("networkidle")
             pdf_page.wait_for_timeout(2000)
@@ -91,13 +135,13 @@ class CharlestonAgent:
                 pdf_page.wait_for_selector("canvas", timeout=15000)
                 print(f"🖼️ PDF canvas found for Book {book} Page {page_num}")
             except TimeoutError:
-                print(f"⚠️ PDF canvas not found, proceeding anyway for Book {book} Page {page_num}")
+                print(f"⚠️ No canvas, proceeding anyway for Book {book} Page {page_num}")
 
             frame = None
             try:
                 frame = pdf_page.query_selector('iframe[src*=".pdf"], embed[type="application/pdf"]')
             except Error as e:
-                print(f"⚠️ Error querying for PDF frame: {e}")
+                print(f"⚠️ Error looking for iframe/embed: {e}")
 
             save_path = os.path.join(output_folder, f"DB_{book}_{page_num}.pdf")
             os.makedirs(output_folder, exist_ok=True)
@@ -109,23 +153,18 @@ class CharlestonAgent:
                     pdf_page.wait_for_load_state("networkidle")
                     pdf_page.wait_for_timeout(2000)
                     pdf_page.pdf(path=save_path)
-                    print(f"✅ Saved deed PDF from iframe src: {save_path}")
+                    print(f"✅ Saved deed PDF from iframe: {save_path}")
                 else:
                     pdf_page.pdf(path=save_path)
-                    print(f"✅ Saved deed PDF directly from page (iframe src blank): {save_path}")
+                    print(f"✅ Saved deed PDF from blank iframe: {save_path}")
             else:
-                url = pdf_page.url.lower()
-                if pdf_page.url.endswith('.pdf') or ('pdf' in url):
-                    pdf_page.pdf(path=save_path)
-                    print(f"✅ Saved deed PDF directly: {save_path}")
-                else:
-                    pdf_page.pdf(path=save_path)
-                    print(f"✅ Saved deed PDF directly from page (no iframe): {save_path}")
+                pdf_page.pdf(path=save_path)
+                print(f"✅ Saved deed PDF from main content: {save_path}")
 
             pdf_page.close()
 
         except TimeoutError as te:
-            print(f"❌ Timeout error on Book {book} Page {page_num}: {te}")
+            print(f"❌ Timeout on Book {book} Page {page_num}: {te}")
             error_path = os.path.join(output_folder, f"error_{book}_{page_num}.png")
             page.screenshot(path=error_path)
             print(f"📸 Screenshot saved: {error_path}")
@@ -136,9 +175,10 @@ class CharlestonAgent:
                 page.screenshot(path=error_path)
                 print(f"📸 Screenshot saved: {error_path}")
             except Exception as ss_e:
-                print(f"⚠️ Failed to take screenshot: {ss_e}")
+                print(f"⚠️ Failed to capture screenshot: {ss_e}")
         finally:
             page.close()
+            isolated_context.close()
 
     def close(self):
         self.context.close()
